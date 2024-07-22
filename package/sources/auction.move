@@ -63,6 +63,27 @@ module miraibay::auction {
     const EInvalidAuctionManagerCap: u64 = 4;
     const EInvalidClaimItemCap: u64 = 5;
 
+    fun init(
+        otw: AUCTION,
+        ctx: &mut TxContext,
+    ) {
+        let publisher = package::claim(otw, ctx);
+
+        let mut display = display::new<Auction>(&publisher, ctx);
+        display.add(b"name".to_string(), b"{name}".to_string());
+        display.add(b"description".to_string(), b"{description}".to_string());
+        display.add(b"seller".to_string(), b"{seller}".to_string());
+        display.add(b"starts_at_ts".to_string(), b"{starts_at_ts}".to_string());
+        display.add(b"ends_at_ts".to_string(), b"{ends_at_ts}".to_string());
+        display.add(b"is_closed".to_string(), b"{is_closed}".to_string());
+        display.add(b"reserve_price".to_string(), b"{reserve_price}".to_string());
+        display.add(b"starting_price".to_string(), b"{starting_price}".to_string());
+        display.add(b"min_bid_increment".to_string(), b"{min_bid_increment}".to_string());
+
+        transfer::public_transfer(display, ctx.sender());
+        transfer::public_transfer(publisher, ctx.sender());
+    }
+    
     public fun new(
         name: String,
         description: Option<String>,
@@ -72,7 +93,7 @@ module miraibay::auction {
         reserve_price: u64,
         starting_price: u64,
         ctx: &mut TxContext,
-    ): (Auction, AuctionManagerCap) {
+    ): AuctionManagerCap {
         let duration = AuctionDuration {
             start_ts: start_ts,
             end_ts: end_ts,
@@ -101,7 +122,9 @@ module miraibay::auction {
             auction_id: object::id(&auction),
         };
         
-        (auction, auction_manager_cap)
+        transfer::share_object(auction);
+
+        auction_manager_cap
     }
 
     public fun bid(
@@ -112,14 +135,19 @@ module miraibay::auction {
     ) {
         assert_auction_active(auction, clock);
 
-        let target_bid_value: u64;
-        if (auction.bid.is_none()) {
-            target_bid_value = auction.pricing.starting_price;
-            assert!(payment.value() >= target_bid_value, 1);
-        } else {
+        // Assert payment is greater than or equal to starting price. This should always be the case.
+        assert!(payment.value() >= auction.pricing.starting_price, 1);
+
+        let mut target_bid_value = auction.pricing.starting_price;
+
+        if (auction.bid.is_some()) {
+            // Extract previous bid if it exists.
             let prev_bid = auction.bid.extract();
+            // Overwrite target bid value with the minimum price of the current bid.
             target_bid_value = prev_bid.payment.value() + auction.pricing.min_bid_increment;
+            // Assert the user's payment is bigly enough.
             assert!(payment.value() >= target_bid_value, 1);
+            // Unwrap the Bid, and transfer previous bid's payment back to the associated bidder. 
             let Bid {
                 bidder,
                 payment,
@@ -128,6 +156,7 @@ module miraibay::auction {
             transfer::public_transfer(payment, bidder);
         };
 
+        // Determine whether 
         let refund_amount = payment.value() - target_bid_value;
         if (refund_amount > 0) {
             let coin_to_refund = payment.split(refund_amount, ctx);
@@ -150,14 +179,6 @@ module miraibay::auction {
         auction.history.push_back(bid_record);
     }
 
-    public fun share(
-        cap: &AuctionManagerCap,
-        auction: Auction,
-    ) {
-        verify_auction_manager_cap(cap, &auction);
-        transfer::share_object(auction) 
-    }
-    
     fun assert_auction_active(
         auction: &Auction,
         clock: &Clock,
