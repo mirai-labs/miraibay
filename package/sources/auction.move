@@ -20,7 +20,7 @@ module miraibay::auction {
         value: u64,
     }
 
-    public struct Auction<T: key + store> has key {
+    public struct Auction<T: key + store> has key, store {
         id: UID,
         name: String,
         prize: Option<T>,
