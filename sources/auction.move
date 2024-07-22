@@ -133,4 +133,24 @@ module miraibay::auction {
         transfer::public_transfer(auction.prize.extract(), prize_recipient);
         coin::from_balance(value, ctx)
     }
+
+    public fun destroy_empty<T: key + store>(
+        auction: Auction<T>,
+    ) {
+        let Auction {
+            id,
+            name: _,
+            prize,
+            starts_at_ts: _,
+            ends_at_ts: _,
+            is_closed: _,
+            reserve_price: _,
+            bid,
+            history,
+        } = auction;
+        id.delete();
+        prize.destroy_none();
+        bid.destroy_none();
+        history.destroy_empty();
+    }
 }
