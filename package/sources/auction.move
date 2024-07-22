@@ -6,14 +6,20 @@ module miraibay::auction {
     use sui::balance::{Self, Balance};
     use sui::clock::{Clock};
     use sui::coin::{Self, Coin};
+    use sui::display::{Self};
+    use sui::package::{Self};
     use sui::sui::{SUI};
     use sui::table_vec::{Self, TableVec};
-    use sui::transfer::{Self, Receiving};
+    use sui::transfer::{Receiving};
     use sui::vec_map::{Self, VecMap};
+
+    public struct AUCTION has drop {}
 
     public struct Auction has key, store {
         id: UID,
         name: String,
+        description: Option<String>,
+        creator: address,
         item_refs: VecMap<ID, TypeName>,
         starts_at_ts: u64,
         ends_at_ts: u64,
@@ -55,8 +61,24 @@ module miraibay::auction {
 
     const MAX_ITEM_COUNT: u8 = 255;
 
+    fun init(
+        otw: AUCTION,
+        ctx: &mut TxContext,
+    ) {
+        let publisher = package::claim(otw, ctx);
+
+        let mut display = display::new<Auction>(&publisher, ctx);
+        display.add(b"name".to_string(), b"{name}".to_string());
+        display.add(b"description".to_string(), b"{description}".to_string());
+        display.add(b"creator".to_string(), b"{creator}".to_string());
+
+        transfer::public_transfer(display, ctx.sender());
+        transfer::public_transfer(publisher, ctx.sender());
+    }
+
     public fun new(
         name: String,
+        description: Option<String>,
         starts_at_ts: u64,
         ends_at_ts: u64,
         reserve_price: u64,
@@ -70,6 +92,8 @@ module miraibay::auction {
         let auction = Auction {
             id: object::new(ctx),
             name: name,
+            description: description,
+            creator: ctx.sender(),
             item_refs: vec_map::empty(),
             starts_at_ts: starts_at_ts,
             ends_at_ts: ends_at_ts,
@@ -199,6 +223,8 @@ module miraibay::auction {
         let Auction {
             id,
             name: _,
+            description: _,
+            creator: _,
             item_refs,
             starts_at_ts: _,
             ends_at_ts: _,
