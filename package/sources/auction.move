@@ -2,11 +2,13 @@ module miraibay::auction {
     
     use std::string::{String};
     use std::type_name::{Self, TypeName};
+    use std::u64;
 
     use sui::balance::{Self, Balance};
     use sui::clock::{Clock};
     use sui::coin::{Self, Coin};
     use sui::display::{Self};
+    use sui::event;
     use sui::package::{Self};
     use sui::sui::{SUI};
     use sui::table_vec::{Self, TableVec};
@@ -15,18 +17,27 @@ module miraibay::auction {
 
     public struct AUCTION has drop {}
 
-    public struct Auction has key, store {
+    public struct Auction has key {
         id: UID,
         name: String,
         description: Option<String>,
         creator: address,
-        item_refs: VecMap<ID, TypeName>,
-        starts_at_ts: u64,
-        ends_at_ts: u64,
-        is_closed: bool,
-        reserve_price: u64,
+        duration: AuctionDuration,
+        pricing: AuctionPricing,
+        items: VecMap<ID, TypeName>,
         bid: Option<Bid>,
         history: TableVec<BidRecord>,
+    }
+
+    public struct AuctionDuration has store {
+        start_ts: u64,
+        end_ts: u64,
+    }
+
+    public struct AuctionPricing has store {
+        min_bid_increment: u64,
+        reserve_price: u64,
+        starting_price: u64,
     }
 
     public struct AuctionManagerCap has key, store {
@@ -36,8 +47,8 @@ module miraibay::auction {
 
     public struct Bid has store {
         bidder: address,
+        payment: Coin<SUI>,
         timestamp: u64,
-        value: Balance<SUI>,
     }
 
     public struct BidRecord has store {
@@ -46,217 +57,119 @@ module miraibay::auction {
         value: u64,
     }
 
-    public struct ClaimItemCap has key, store {
-        id: UID,
-        auction_id: ID,
-        item_id: ID,
-        item_typename: TypeName
-    }
-
     const EAuctionIsClosed: u64 = 1;
     const EAuctionNotStarted: u64 = 2;
     const EAuctionNotEnded: u64 = 3;
     const EInvalidAuctionManagerCap: u64 = 4;
     const EInvalidClaimItemCap: u64 = 5;
 
-    const MAX_ITEM_COUNT: u8 = 255;
-
-    fun init(
-        otw: AUCTION,
-        ctx: &mut TxContext,
-    ) {
-        let publisher = package::claim(otw, ctx);
-
-        let mut display = display::new<Auction>(&publisher, ctx);
-        display.add(b"name".to_string(), b"{name}".to_string());
-        display.add(b"description".to_string(), b"{description}".to_string());
-        display.add(b"creator".to_string(), b"{creator}".to_string());
-
-        transfer::public_transfer(display, ctx.sender());
-        transfer::public_transfer(publisher, ctx.sender());
-    }
-
     public fun new(
         name: String,
         description: Option<String>,
-        starts_at_ts: u64,
-        ends_at_ts: u64,
+        start_ts: u64,
+        end_ts: u64,
+        min_bid_increment: u64,
         reserve_price: u64,
+        starting_price: u64,
         ctx: &mut TxContext,
     ): (Auction, AuctionManagerCap) {
-        let opening_bid = Bid {
-            bidder: ctx.sender(),
-            timestamp: starts_at_ts,
-            value: balance::zero(),
+        let duration = AuctionDuration {
+            start_ts: start_ts,
+            end_ts: end_ts,
         };
+
+        let pricing = AuctionPricing {
+            min_bid_increment: min_bid_increment,
+            reserve_price: reserve_price,
+            starting_price: starting_price,
+        };
+        
         let auction = Auction {
             id: object::new(ctx),
             name: name,
             description: description,
             creator: ctx.sender(),
-            item_refs: vec_map::empty(),
-            starts_at_ts: starts_at_ts,
-            ends_at_ts: ends_at_ts,
-            is_closed: false,
-            reserve_price: reserve_price,
-            bid: option::some(opening_bid),
+            duration: duration,
+            pricing: pricing,
+            items: vec_map::empty(),
+            bid: option::none(),
             history: table_vec::empty(ctx),
         };
-        let manager_cap = AuctionManagerCap {
+
+        let auction_manager_cap = AuctionManagerCap {
             id: object::new(ctx),
             auction_id: object::id(&auction),
         };
-        (auction, manager_cap)
+        
+        (auction, auction_manager_cap)
     }
 
     public fun bid(
         auction: &mut Auction,
-        payment: Coin<SUI>,
+        mut payment: Coin<SUI>,
         clock: &Clock,
         ctx: &mut TxContext,
     ) {
-        assert!(auction.is_closed == false, EAuctionIsClosed);
-        assert_auction_not_ended(auction, clock);
-        assert_auction_not_started(auction, clock);
+        assert_auction_active(auction, clock);
 
-        // Extract the current bid from the Auction.
-        let current_bid = auction.bid.extract();
-        // Verify the value of the incoming bid is greater than the current bid value.
-        assert!(payment.value() > current_bid.value.value(), 1);
-        // Unwrap the current bid.
-        let Bid {
-            bidder,
-            timestamp,
-            value,
-        } = current_bid;
-        let record = BidRecord {
-            bidder: bidder,
-            timestamp: timestamp,
-            value: value.value(),
+        let target_bid_value: u64;
+        if (auction.bid.is_none()) {
+            target_bid_value = auction.pricing.starting_price;
+            assert!(payment.value() >= target_bid_value, 1);
+        } else {
+            let prev_bid = auction.bid.extract();
+            target_bid_value = prev_bid.payment.value() + auction.pricing.min_bid_increment;
+            assert!(payment.value() >= target_bid_value, 1);
+            let Bid {
+                bidder,
+                payment,
+                timestamp: _,
+            } = prev_bid;
+            transfer::public_transfer(payment, bidder);
         };
-        // Add bid record to auction history.
-        auction.history.push_back(record);
-        // Transfer the extracted payment to the original bidder.
-        transfer::public_transfer(coin::from_balance(value, ctx), bidder);
 
-        // Create a new bid and put it into the auction.
-        let new_bid = Bid {
+        let refund_amount = payment.value() - target_bid_value;
+        if (refund_amount > 0) {
+            let coin_to_refund = payment.split(refund_amount, ctx);
+            transfer::public_transfer(coin_to_refund, ctx.sender());
+        };
+    
+        let bid = Bid {
             bidder: ctx.sender(),
+            payment: payment,
             timestamp: clock.timestamp_ms(),
-            value: payment.into_balance(),
         };
-        auction.bid.fill(new_bid);
-    }
-
-    public fun close(
-        cap: &AuctionManagerCap,
-        auction: &mut Auction,
-        ctx: &mut TxContext,
-    ): Coin<SUI> {
-        assert_auction_manager_cap(cap, auction);
-
-        let last_bid = auction.bid.extract();
-        let Bid {
-            bidder,
-            timestamp: _,
-            value,
-        } = last_bid;
-
-        let mut item_recipient = ctx.sender();
-        if (value.value() > auction.reserve_price) {
-            item_recipient = bidder;
-        };
-
-        while (!auction.item_refs.is_empty()) {
-            let (item_id, item_typename) = auction.item_refs.remove_entry_by_idx(0);
-            let claim_item_cap = ClaimItemCap {
-                id: object::new(ctx),
-                auction_id: object::id(auction),
-                item_id: item_id,
-                item_typename: item_typename,
-            };
-            transfer::public_transfer(claim_item_cap, item_recipient);
-        };
-
-        coin::from_balance(value, ctx)
-    }
-
-    public fun add_item<T: key + store>(
-        cap: &AuctionManagerCap,
-        auction: &mut Auction,
-        item: T,
-        clock: &Clock,
-    ) {
-        assert_auction_manager_cap(cap, auction);
-        assert_auction_not_started(auction, clock);
-        assert!(auction.item_refs.size() as u8 < MAX_ITEM_COUNT);
-        auction.item_refs.insert(object::id(&item), type_name::get<T>());
-        transfer::public_transfer(item, auction.id.to_address());
-    }
-
-    public fun claim_item<T: key + store>(
-        cap: ClaimItemCap,
-        auction: &mut Auction,
-        item_to_receive: Receiving<T>,
-        ctx: &mut TxContext,
-    ) {
-        assert!(cap.auction_id == object::id(auction), EInvalidClaimItemCap);
-        assert!(cap.item_id == transfer::receiving_object_id(&item_to_receive), EInvalidClaimItemCap);
-        assert!(cap.item_typename == type_name::get<T>(), EInvalidClaimItemCap);
-
-        let item = transfer::public_receive(&mut auction.id, item_to_receive);
-        auction.item_refs.remove(&object::id(&item));
-        transfer::public_transfer(item, ctx.sender());
         
-        let ClaimItemCap {
-            id,
-            auction_id: _,
-            item_id: _,
-            item_typename: _,
-        } = cap;
-        id.delete();
+        let bid_record = BidRecord {
+            bidder: bid.bidder,
+            timestamp: bid.timestamp,
+            value: bid.payment.value(),
+        };
+
+        auction.bid.fill(bid);
+        auction.history.push_back(bid_record);
     }
 
-    public fun destroy_empty(
+    public fun share(
+        cap: &AuctionManagerCap,
         auction: Auction,
     ) {
-        let Auction {
-            id,
-            name: _,
-            description: _,
-            creator: _,
-            item_refs,
-            starts_at_ts: _,
-            ends_at_ts: _,
-            is_closed: _,
-            reserve_price: _,
-            bid,
-            history,
-        } = auction;
-        id.delete();
-        item_refs.destroy_empty();
-        bid.destroy_none();
-        history.destroy_empty();
+        verify_auction_manager_cap(cap, &auction);
+        transfer::share_object(auction) 
+    }
+    
+    fun assert_auction_active(
+        auction: &Auction,
+        clock: &Clock,
+    ) {
+        assert!(clock.timestamp_ms() > auction.duration.start_ts, 1);
+        assert!(clock.timestamp_ms() < auction.duration.end_ts, 2);
     }
 
-    fun assert_auction_manager_cap(
+    fun verify_auction_manager_cap(
         cap: &AuctionManagerCap,
         auction: &Auction,
     ) {
         assert!(cap.auction_id == object::id(auction), EInvalidAuctionManagerCap);
-    }
-
-    fun assert_auction_not_ended(
-        auction: &Auction,
-        clock: &Clock,
-    ) {
-        assert!(clock.timestamp_ms() < auction.ends_at_ts, EAuctionNotEnded);
-    }
-    
-    fun assert_auction_not_started(
-        auction: &Auction,
-        clock: &Clock,
-    ) {
-        assert!(clock.timestamp_ms() > auction.starts_at_ts, EAuctionNotStarted);
     }
 }

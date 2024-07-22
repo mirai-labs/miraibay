@@ -6,6 +6,9 @@ const { networkConfig, useNetworkVariable, useNetworkVariables } =
     devnet: {
       url: getFullnodeUrl("devnet"),
     },
+    localnet: {
+      url: getFullnodeUrl("localnet"),
+    },
     testnet: {
       url: getFullnodeUrl("testnet"),
     },
