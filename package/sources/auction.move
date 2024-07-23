@@ -45,6 +45,13 @@ module miraibay::auction {
         auction_id: ID,
     }
 
+    public struct ClaimItemCap has key, store {
+        id: UID,
+        auction_id: ID,
+        item_id: ID,
+        item_typename: TypeName
+    }
+
     public struct Bid has store {
         bidder: address,
         payment: Coin<SUI>,
@@ -56,6 +63,8 @@ module miraibay::auction {
         timestamp: u64,
         value: u64,
     }
+
+    const MAX_ITEM_COUNT: u8 = 255;
 
     const EAuctionIsClosed: u64 = 1;
     const EAuctionNotStarted: u64 = 2;
@@ -177,6 +186,42 @@ module miraibay::auction {
 
         auction.bid.fill(bid);
         auction.history.push_back(bid_record);
+    }
+
+    public fun add_item<T: key + store>(
+        cap: &AuctionManagerCap,
+        auction: &mut Auction,
+        item: T,
+        clock: &Clock,
+    ) {
+        verify_auction_manager_cap(cap, auction);
+        assert_auction_active(auction, clock);
+        assert!(auction.items.size() as u8 < MAX_ITEM_COUNT);
+        auction.items.insert(object::id(&item), type_name::get<T>());
+        transfer::public_transfer(item, auction.id.to_address());
+    }
+
+    public fun claim_item<T: key + store>(
+        cap: ClaimItemCap,
+        auction: &mut Auction,
+        item_to_receive: Receiving<T>,
+        ctx: &mut TxContext,
+    ) {
+        assert!(cap.auction_id == object::id(auction), EInvalidClaimItemCap);
+        assert!(cap.item_id == transfer::receiving_object_id(&item_to_receive), EInvalidClaimItemCap);
+        assert!(cap.item_typename == type_name::get<T>(), EInvalidClaimItemCap);
+
+        let item = transfer::public_receive(&mut auction.id, item_to_receive);
+        auction.items.remove(&object::id(&item));
+        transfer::public_transfer(item, ctx.sender());
+        
+        let ClaimItemCap {
+            id,
+            auction_id: _,
+            item_id: _,
+            item_typename: _,
+        } = cap;
+        id.delete();
     }
 
     fun assert_auction_active(
